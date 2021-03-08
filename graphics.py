@@ -2,7 +2,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import csv
 
-def plot_data(Kp: float, Kd: float, Ki: float, P: int, V: int, VF: int, B: int, R: int):
+map = {
+    'pos': {
+        'label': 'position',
+        'units': 'deg'
+    },
+    'vel': {
+        'label': 'velocity',
+        'units': 'deg/s'
+    },
+    'tor': {
+        'label': 'torque',
+        'units': 'mN*m'
+    }
+}
+
+def plot_data(plot='pos', **kwargs):
     """Plots motor position with respect to time. Used to test PID controller
 
     Args:
@@ -33,14 +48,28 @@ def plot_data(Kp: float, Kd: float, Ki: float, P: int, V: int, VF: int, B: int, 
     pos_raw = data[:, 0]
     turns = data[:, 4]
     pos = pos_raw/(2**14)*360 + turns*360
-    pos = pos[::-1]
+    vel = data[:, 1]
+    tor = data[:, 2]
+    data_map = {
+        'pos': pos,
+        'vel': vel,
+        'tor': tor
+    }
     time = data[:, 5]
-    ax.plot(time, pos, label='Position')
-    ax.plot(time, time*0 + P, 'r', label='Desired position')
+    ax.plot(time, data_map[plot], label=map[plot]['label'])
+    if plot == 'pos':
+        ax.plot(time, time*0 + kwargs['P'], 'r', label=f'desired {map[plot]["label"]}')
+    if plot == 'vel':
+        ax.plot(time, time * 0 + kwargs['V'], 'r', label=f'desired {map[plot]["label"]}')
     ax.set_xlabel('Time (sec)')
-    ax.set_ylabel('Position (deg)')
+    ax.set_ylabel(f'{map[plot]["label"]} ({map[plot]["units"]})')
     ax.legend()
     ax.grid()
-    fig.savefig(f'plots/KP_{Kp}_KD_{Kd}_KI_{Ki}_X_{P}_V_{V}_VF_{VF}_B_{B}_R_{R}.pdf', format='pdf')
+    plt.tight_layout()
+    file_str = ''
+    for k, v in kwargs.items():
+        file_str += f'{k}_{v}_'
+    file_str = file_str[:-1]
+    fig.savefig(f'plots/{plot}**{file_str}.pdf', format='pdf')
     fig.clf()
     plt.close(fig)

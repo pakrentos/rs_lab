@@ -3,10 +3,13 @@ from can import CAN_Bus
 from time import time
 from typing import NoReturn, Optional, Union, List, Tuple
 from time import sleep
+# from scipy import integrate
 import multiprocessing as mp
 from datetime import datetime as dt
+import sys
 import csv
 import os
+from toolz import curry
 
 class CAN_Device:
     dev_id: int
@@ -38,16 +41,18 @@ class CAN_MotorStatus:
     tmp_data: int = None
     time_data: float = None
     time_start: float
+    frmt_str_len = 0
 
     log: List[Tuple[int, int, int, int, int]] = []
 
     turns: int = 0
     FULL_TURN: int = 2**14
 
-    def __init__(self, log: bool = False, thresholds=(2**12, (2**12)*3)):
+    def __init__(self, log: bool = False, thresholds=(2**12, (2**12)*3), verbose=False):
         self.LOG_SET = log
         self.thrshld = thresholds
         self.time_start = time()
+        self.verbose = verbose
     
     def save_state(self):
         self.log.append((self.encoder_data, self.speed_data, self.torque_data, self.tmp_data, self.turns, self.time_data))
@@ -55,15 +60,28 @@ class CAN_MotorStatus:
     def process_data(self, data: bytes) -> None:
         self.encoder_bytes = data[6:]
         self.speed_bytes = data[4:6]
-        encoder_temp = int.from_bytes(self.encoder_bytes,byteorder = 'little')
-        speed_temp = int.from_bytes(self.speed_bytes,byteorder = 'little', signed=True)
+        self.torque_bytes = data[2:4]
+        encoder_temp = int.from_bytes(self.encoder_bytes, byteorder='little')
+        speed_temp = int.from_bytes(self.speed_bytes, byteorder='little', signed=True)
+        torque_temp = int.from_bytes(self.torque_bytes, byteorder='little', signed=True)
         time_temp = time() - self.time_start
         if self.encoder_data is not None:
             self.process_encoder(encoder_temp, speed_temp, time_temp)
         self.speed_data = speed_temp
         self.encoder_data = encoder_temp
         self.time_data = time_temp
+        self.torque_data = torque_temp*0.82
+        if self.verbose:
+            self.print_state()
         self.save_state()
+
+    def print_state(self):
+        pos = np.around(self.encoder_data/self.FULL_TURN*360 + self.turns*360, 2)
+        frmt_str = f'POS: {pos:<10} VEL: {self.speed_data:<10} TOR: {self.torque_data}'
+        self.frmt_str_len = len(frmt_str)
+        sys.stdout.flush()
+        sys.stdout.write("\b" * (self.frmt_str_len + 1))
+        sys.stdout.write(frmt_str)
     
     def process_encoder(self, next_p, next_s, next_t) -> None:
         threshold_hi = self.thrshld[1]
@@ -99,18 +117,9 @@ class CAN_MotorStatus:
 
     def get_data(self, v_filter: int = 1):
         # velocity filtration
-        data = np.array(self.log[-v_filter:])
-        vel = np.mean(data[:, 1].flatten())
-        return self.encoder_data + self.turns*self.FULL_TURN, vel
-    
-    # def _get_pos_int(self, time_stamp=0)
-    # "Returns ∫qdt, where q measured in degrees"
-    #     data = np.array(self.log)
+        vel = self.speed_data
+        return self.encoder_data + self.turns*self.FULL_TURN, vel, self.encoder_data
 
-    #     time = data[:, 5].T[0]
-    #     pos = data[:, 0].T[0]
-    #     turns = data[:, 4].T[0]*self.FULL_TURN
-    #     pos = pos + turns
 
     def reset_log(self):
         self.log = []
@@ -138,17 +147,18 @@ class CAN_Motor(CAN_Device):
     K_P: float = 0
     K_D: float = 0
 
-    def __init__(self, dev_id: int, bus: CAN_Bus, log: bool = False):
+    def __init__(self, dev_id: int, bus: CAN_Bus, log: bool = False, verbose=False):
         super().__init__(dev_id, bus)
-        self.status = CAN_MotorStatus(log=log)
+        self.status = CAN_MotorStatus(log=log, verbose=verbose)
 
-    def _generate_torque_frame(self, val: int, bound = 200):
-        if bound > 2000:
+    def _generate_torque_frame(self, val: float, bound = 1.64):
+        if val >= 1.64:
             raise ValueError('Torque must be in range [-2000; 2000]')
-
         val = bound if val > bound else val
         val = -bound if val < -bound else val
-        print(f'torque_val: {val}')
+        val = int(val/0.00082)
+        # print(val)
+
         val_b = val.to_bytes(2, 'little', signed=True)
         temp = self.TORQUE_CONTROL_BASE + 3*b'\x00' + val_b + 2*b'\x00'
         return temp
@@ -157,7 +167,11 @@ class CAN_Motor(CAN_Device):
         frame = self._generate_torque_frame(val, bound=bound)
         self.send(frame)
         self.recv_status()
-    
+
+    def gravity_compensation(self, pos, mass=0.062):
+        g = 9.82
+        return mass*g*np.cos(pos/180*np.pi -np.pi/2)*0.094
+
     def PD_control(self, q, qdot, Kp=10, Kd=1, Ki=0, bound = 50, v_filter=1):
         self.send(self.MOTOR_STATUS_BASE)
         self.recv_status()
@@ -169,9 +183,10 @@ class CAN_Motor(CAN_Device):
             qr = self._calc_degrees(qr)
             t = Kp*(q - qr) + Kd*(qdot - qdotr)
             e = np.abs(qr - q)
-            self._send_n_rcv_torque(int(t), bound = bound)
+            self._send_n_rcv_torque(t, bound=bound)
+        self._send_n_rcv_torque(0, bound=bound)
     
-    def PID_control(self, P, V, Kp=10, Kd=1, Ki=0, B = 2000, VF=1, R=1):
+    def PID_control(self, P, V, Kp=10, Kd=1, Ki=0, B = 2000, VF=1, R=1, grav_comp=True, desired=False):
         self.send(self.MOTOR_STATUS_BASE)
         self.recv_status()
         i = 0
@@ -179,15 +194,18 @@ class CAN_Motor(CAN_Device):
         timeline = []
         start = time()
         while True:
-            if i % R == 0:
-                qr, qdotr = self.status.get_data(v_filter=VF)
-                qr = self._calc_degrees(qr)
-                timeline.append(time() - start)
-                errors.append(P - qr)
-                t = Kp*(P - qr) + Kd*(V - qdotr) + Ki*np.trapz(errors, x=timeline)
-                print(f'pos: {qr}, vel: {qdotr}, torque: {t}', end='')
-                self._send_n_rcv_torque(int(t), bound = B)
-            i += 1
+            qr, qdotr, real_q = self.status.get_data(v_filter=VF)
+            qr = self._calc_degrees(qr)
+            # if qdotr
+            timeline.append(time() - start)
+            errors.append(P - qr)
+                # print(np.cos(qr/180*np.pi))
+            t = Kp*(P - qr) + Kd*(V - qdotr) + Ki*np.trapz(errors, x=timeline)
+            if grav_comp:
+                g_comp = self.gravity_compensation(qr) if not desired else self.gravity_compensation(P)
+                t += g_comp
+                # print(t)
+            self._send_n_rcv_torque(t, bound = B)
 
     
     def smooth_off(self, Kd=1):
@@ -208,17 +226,107 @@ class CAN_Motor(CAN_Device):
         self.status.write_log()
         self.status.reset_log()
 
-        
+    def new_trap(self, am, vm, f, x):
+        T = 1 / f
+        s = np.ceil(x * f / vm)
+        n = np.ceil(x * f * f / (am * s))
 
-    
-    # def smooth_off(self):
-    #     torques = np.linspace(self.current_torque, 0, 5, dtype=np.int16)
-    #     for t in torques:
-    #         self._send_n_rcv_torque(int(t))
-    #         sleep(0.1)
-    #     while np.abs(self.current_vel) > 1:
-    #         self.recv_data()
-    #         self.get_inst_vel()
+        while n > s:
+            s += 1
+            n = np.ceil(x * f * f / (am * s))
+
+        n = np.ceil(x * f * f / (s * am))
+        k = s - n
+        a = x * f * f / (s * n)
+        v = a * n / f
+        tc = n * T
+        tf = (2 * n + k) * T
+
+        return tc, tf, a, v, k, n
+
+    @curry
+    def trap_v_func(self, tc, tf, acc, t):
+        if isinstance(t, np.ndarray):
+            mask_tc = t < tc
+            mask_tc_tftc = (t >= tc) * (t < (tf - tc))
+            mask_tftc_tf = t >= (tf - tc)
+            res = np.ones(t.shape[0])
+            res[mask_tc] *= acc * t[mask_tc]
+            res[mask_tc_tftc] *= acc * tc
+            res[mask_tftc_tf] *= acc * (tc - (t[mask_tftc_tf] - (tf - tc)))
+            return res
+
+        if t < tc:
+            return acc * t
+        elif t >= tc and t < (tf - tc):
+            return acc * tc
+        elif t >= (tf - tc):
+            return acc * (tc - (t - (tf - tc)))
+        else:
+            raise ValueError('Out of bounds')
+
+    @curry
+    def trap_x_func(self, tc, tf, acc, t):
+        tc_path = acc * tc * tc / 2
+        tc_tf_path = acc * tc * (tf - 1.5 * tc)
+        if t < tc:
+            return acc * t * t / 2
+        elif t >= tc and t < (tf - tc):
+            return acc * tc * (t - tc) + tc_path
+        elif t >= (tf - tc) and t <= tf:
+            temp = tf - t
+            return tc_path + tc_tf_path - acc * temp * temp / 2
+        else:
+            raise ValueError('Out of bounds')
+
+    def trap_func(self, a, v, x):
+        self.send(self.MOTOR_STATUS_BASE)
+        self.recv_status()
+        tc, tf, a, v, _, _ = self.new_trap(a/180*np.pi, v/180*np.pi, 100, x/180*np.pi)
+        vf = self.trap_v_func(tc, tf, a)
+        xf = self.trap_x_func(tc, tf, a)
+        print(tc, tf)
+        # torque = 0.062*((0.094*2)**2)*a
+        # torque = 30*0.00082
+        # tc = 0.5
+        # tf = tc*2
+        delta = 0
+        start = time()
+
+        while delta <= tf:
+            qr, dq, _ = self.status.get_data(v_filter=1)
+            qr = self._calc_degrees(qr)
+            eq = xf(delta) - qr/180*np.pi
+            edq = vf(delta) - dq/180*np.pi
+            pd_term = eq*0.3 + edq*0.03
+            # if pd_term >= 0.021:
+            #     pd_term = 0.021
+            # if pd_term <= -0.021:
+            #     pd_term = -0.021
+            res_torque = pd_term + self.gravity_compensation(qr)
+            self._send_n_rcv_torque(res_torque)
+            delta = time() - start
+
+        # while delta > tc and delta <= tf - tc:
+        #     qr, _, _ = self.status.get_data(v_filter=1)
+        #     qr = self._calc_degrees(qr)
+        #     res_torque = 0 + self.gravity_compensation(qr)
+        #     self._send_n_rcv_torque(res_torque)
+        #     delta = time() - start
+        #
+        # while delta <= tf:
+        #     qr, _, _ = self.status.get_data(v_filter=1)
+        #     qr = self._calc_degrees(qr)
+        #     res_torque = -torque + self.gravity_compensation(qr)
+        #     self._send_n_rcv_torque(res_torque)
+        #     delta = time() - start
+
+        while True:
+            qr, _, _ = self.status.get_data(v_filter=1)
+            qr = self._calc_degrees(qr)
+            res_torque = 0 + self.gravity_compensation(qr)
+            self._send_n_rcv_torque(res_torque)
+
     
     def motor_off(self):
         self.send(self.MOTOR_OFF_BASE)
