@@ -11,6 +11,58 @@ import csv
 import os
 from toolz import curry
 
+class FeedbackLinearization:
+
+    def __init__(self, l, m, J, b, g, f):
+        self.params = l, m, J, b, g
+        self.control_func = f
+
+    def control_law(self, q, qd):
+        Qd = self.Q_d(q, qd)
+        D = (1/self.D(q))*self.control_func(q, qd)
+        h = self.h(q, qd)
+        res = Qd + h + D
+        return res
+
+    def D(self, q):
+        l, m, J, b, g = self.params
+
+        d11 = m * l ** 2 + J
+        # d12 = m[1] * l[0] * l[1] * np.cos(alpha_1 - alpha_2)
+        # d21 = d12
+        # d22 = m[1] * l[1] ** 2 + J[1]
+        return d11 #np.array([[d11, d12], [d21, d22]])
+
+    def c_term(self, q, dq):
+        # alpha_1 = q
+        # alpha_2 = 0
+        # dalpha_1 = dq
+        # dalpha_2 = 0
+        #
+        # l, m, J, b, g = self.params
+        #
+        # c1 = m[1] * l[0] * l[1] * np.sin(alpha_1 - alpha_2) * dalpha_2 ** 2
+        # c2 = -m[1] * l[0] * l[1] * np.sin(alpha_1 - alpha_2) * dalpha_1 ** 2
+        return 0#np.array([c1, c2])
+
+    def g_term(self, q):
+        alpha_1 = q
+
+        l, m, J, b, g = self.params
+
+        g1 = m * g * l * np.cos(alpha_1)
+        return g1
+
+    def Q_d(self, q, dq):
+        dalpha_1 = dq
+        l, m, J, b, g = self.params
+        Q_d_1 = b * dalpha_1
+        # Q_d_2 = b[1] * dalpha_2
+        return Q_d_1
+
+    def h(self, q, dq):
+        return self.c_term(q, dq) + self.g_term(q)
+
 class CAN_Device:
     dev_id: int
     bus: CAN_Bus 
@@ -87,36 +139,12 @@ class CAN_MotorStatus:
         threshold_hi = self.thrshld[1]
         threshold_lo = self.thrshld[0]
         prev_p = self.encoder_data
-        
-
-        delta_t = (next_t - self.time_data)
-        speed_av = self.speed_data # average speed between previous moment and next moment
-
-        # if np.abs(speed_av) < 700:
         if prev_p > threshold_hi and next_p <= threshold_lo:
             self.turns += 1
         elif prev_p <= threshold_lo and next_p > threshold_hi:
             self.turns -= 1
-        # else:
-        #     delta_p = next_p - prev_p
-        #     calc_s = delta_p/delta_t
-
-        #     if calc_s < 0 and self.speed_data > 0:
-        #         self.turns += 1
-        #     elif calc_s > 0 and self.speed_data < 0:
-        #         self.turns -= 1
-
-        # current = data
-        # # print(np.log(prev)/np.log(2), np.log(current)/np.log(2))
-        # # print(prev < self.thrshld[0], current >= self.thrshld[1])
-        # if prev > current and self.speed_data > 0:
-        #     # print("a")
-        #     self.turns += 1
-        # elif prev < current and self.speed_data < 0:
-        #     self.turns -= 1
 
     def get_data(self, v_filter: int = 1):
-        # velocity filtration
         vel = self.speed_data
         return self.encoder_data + self.turns*self.FULL_TURN, vel, self.encoder_data
 
@@ -206,6 +234,19 @@ class CAN_Motor(CAN_Device):
                 t += g_comp
                 # print(t)
             self._send_n_rcv_torque(t, bound = B)
+
+    def FL(self):
+        self.send(self.MOTOR_STATUS_BASE)
+        self.recv_status()
+        control_f = lambda q, dq: 0.2 * (np.sin(time()) - q) + 0.02 * (np.cos(time()) - dq)
+        # fl_obj = FeedbackLinearization(0.1*2, 0.062, 0.062*((0.1*2)**2), 0.01, 9.82, control_f)
+
+        while True:
+            qr, dq, _ = self.status.get_data(v_filter=1)
+            qr = self._calc_radians(qr) - np.pi/2
+            dq = dq/180*np.pi
+            res_torque = control_f(qr, dq)#fl_obj.control_law(qr, dq)
+            self._send_n_rcv_torque(res_torque)
 
     
     def smooth_off(self, Kd=1):
@@ -307,20 +348,6 @@ class CAN_Motor(CAN_Device):
             self._send_n_rcv_torque(res_torque)
             delta = time() - start
 
-        # while delta > tc and delta <= tf - tc:
-        #     qr, _, _ = self.status.get_data(v_filter=1)
-        #     qr = self._calc_degrees(qr)
-        #     res_torque = 0 + self.gravity_compensation(qr)
-        #     self._send_n_rcv_torque(res_torque)
-        #     delta = time() - start
-        #
-        # while delta <= tf:
-        #     qr, _, _ = self.status.get_data(v_filter=1)
-        #     qr = self._calc_degrees(qr)
-        #     res_torque = -torque + self.gravity_compensation(qr)
-        #     self._send_n_rcv_torque(res_torque)
-        #     delta = time() - start
-
         while True:
             qr, _, _ = self.status.get_data(v_filter=1)
             qr = self._calc_degrees(qr)
@@ -356,21 +383,3 @@ class CAN_Motor(CAN_Device):
 
     def get_inst_vel(self) -> Optional[float]:
         return self.status.get_data()[1]
-
-    # def get_inst_vel_calc(self, threshold_lo: int=2**4, threshold_hi: int = 2**12) -> Optional[float]:
-    #     self.send(self.MOTOR_STATUS_BASE)
-    #     data = self.recive()
-    #     dt = time() - self.current_time
-    #     if data is None:
-    #         return
-
-    #     parsed = int.from_bytes(data[6:],byteorder = 'little')
-    #     ds = parsed - self.current_position
-    #     return ds/dt
-
-    # def get_inst_vel_filtered(self, threshold_lo: int=2**4, threshold_hi: int = 2**12) -> Optional[float]:
-    #     self.recv_data()
-    #     self._recv_pos()
-    #     return np.mean(self.current_positions)
-    
-    

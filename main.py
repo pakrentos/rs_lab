@@ -9,7 +9,7 @@ from graphics import plot_data
 
 bus = CAN_Bus(interface ='can0', bitrate=1000000)
 motor = CAN_Motor(0x141, bus)
-# motor.send(b'\x19' + 7*b'\x00')
+motor.send(b'\x19' + 7*b'\x00')
 start = time()
 pos = []
 vel = []
@@ -33,7 +33,6 @@ bounds = [200, 50]
 filters = [1, 20]
 reducers = [1, 5]
 
-# print(tasks)
 motor.send(b'\x9B' + 7*b'\x00')
 print(motor.recive())
 motor.send(b'\x88' + 7*b'\x00')
@@ -50,16 +49,18 @@ params = {
     'grav_comp': True,
     'desired': True
 }
+# while
+
 try:
     # motor.PID_control(**params)
-    motor.trap_func(20, 50, 180)
+    strt = time()
+    motor.FL()
 except KeyboardInterrupt:
     motor.reset_log()
     motor._send_n_rcv_torque(0)
-    # plot_data(plot='tor', **params)
-    # plot_data(plot='vel', **params)
-    plot_data(plot='pos', **params)
-
+    plot_data(plot='pos', name='pd_pos', strt_time=strt, **params)
+    plot_data(plot='tor', name='pd_tor', **params)
+# plot_data(plot='tor', name='fl_tor', **params)
 
 # except KeyboardInterrupt:
 #     print('Exiting...')
